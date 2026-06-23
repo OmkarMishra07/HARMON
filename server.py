@@ -258,12 +258,28 @@ YDL_FULL = {
     "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True, "no_warnings": True,
     "skip_download": True, "noplaylist": True,
+    "extractor_args": {
+        "youtube": {
+            "client": ["android", "ios"]
+        }
+    }
 }
 YDL_FLAT = {
     "quiet": True, "no_warnings": True,
     "skip_download": True, "noplaylist": True,
     "extract_flat": True,
+    "extractor_args": {
+        "youtube": {
+            "client": ["android", "ios"]
+        }
+    }
 }
+
+cookies_path = "cookies.txt"
+if os.path.exists(cookies_path):
+    YDL_FULL["cookiefile"] = cookies_path
+    YDL_FLAT["cookiefile"] = cookies_path
+    log.info("[yt-dlp] Using local cookies.txt for YouTube authentication.")
 YT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
