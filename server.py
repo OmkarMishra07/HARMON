@@ -38,17 +38,26 @@ executor = ThreadPoolExecutor(max_workers=8)
 
 
 # ── AWS / S3 config ───────────────────────────────────────────────────────────
-S3_BUCKET     = os.environ["S3_BUCKET"]
-S3_REGION     = os.environ["AWS_REGION"]
-AWS_ACCESS    = os.environ["AWS_ACCESS_KEY_ID"]
-AWS_SECRET    = os.environ["AWS_SECRET_ACCESS_KEY"]
+S3_BUCKET     = os.environ.get("S3_BUCKET")
+S3_REGION     = os.environ.get("AWS_REGION")
+AWS_ACCESS    = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET    = os.environ.get("AWS_SECRET_ACCESS_KEY")
 
-s3 = boto3.client(
-    "s3",
-    region_name=S3_REGION,
-    aws_access_key_id=AWS_ACCESS,
-    aws_secret_access_key=AWS_SECRET,
-)
+s3 = None
+if S3_BUCKET and S3_REGION and AWS_ACCESS and AWS_SECRET:
+    try:
+        s3 = boto3.client(
+            "s3",
+            region_name=S3_REGION,
+            aws_access_key_id=AWS_ACCESS,
+            aws_secret_access_key=AWS_SECRET,
+        )
+        log.info(f"[S3] Client initialized successfully for bucket '{S3_BUCKET}'")
+    except Exception as e:
+        log.error(f"[S3] Failed to initialize client: {e}")
+        s3 = None
+else:
+    log.warning("[S3] Environment variables missing. Running in local fallback mode (no S3 cache).")
 
 import re
 
@@ -100,6 +109,8 @@ def _meta_key(vid: str)  -> str: return f"meta/{vid}.json"
 
 # ── S3 CORS (browser needs this to play audio directly from S3) ───────────────
 def _setup_s3_cors():
+    if not s3:
+        return
     try:
         s3.put_bucket_cors(
             Bucket=S3_BUCKET,
@@ -121,13 +132,17 @@ def _setup_s3_cors():
 
 # ── S3 helpers ────────────────────────────────────────────────────────────────
 def _s3_exists(key: str) -> bool:
+    if not s3:
+        return False
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=key)
         return True
-    except ClientError:
+    except Exception:
         return False
 
 def _s3_presigned(key: str, expires: int = 3600) -> str:
+    if not s3:
+        return ""
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": key},
@@ -135,19 +150,26 @@ def _s3_presigned(key: str, expires: int = 3600) -> str:
     )
 
 def _s3_get_meta(vid: str) -> dict | None:
+    if not s3:
+        return None
     try:
         obj = s3.get_object(Bucket=S3_BUCKET, Key=_meta_key(vid))
         return json.loads(obj["Body"].read())
-    except ClientError:
+    except Exception:
         return None
 
 def _s3_put_meta(vid: str, meta: dict):
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=_meta_key(vid),
-        Body=json.dumps(meta).encode(),
-        ContentType="application/json",
-    )
+    if not s3:
+        return
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=_meta_key(vid),
+            Body=json.dumps(meta).encode(),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        log.warning(f"[S3] Failed to put meta: {e}")
 
 
 # ── Background S3 upload ──────────────────────────────────────────────────────
@@ -158,6 +180,8 @@ def _bg_upload(yt_url: str, vid: str, meta: dict):
     Background thread: download audio from YouTube → upload to S3.
     User is already listening; this runs silently behind the scenes.
     """
+    if not s3:
+        return
     if vid in _uploading:
         return
     _uploading.add(vid)
