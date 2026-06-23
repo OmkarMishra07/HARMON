@@ -1,0 +1,4 @@
+.env
+vid_map.json
+__pycache__/
+*.pyc

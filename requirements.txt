@@ -1,0 +1,7 @@
+flask
+flask-cors
+yt-dlp
+requests
+boto3
+python-dotenv
+gunicorn
