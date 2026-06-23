@@ -258,21 +258,11 @@ YDL_FULL = {
     "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True, "no_warnings": True,
     "skip_download": True, "noplaylist": True,
-    "extractor_args": {
-        "youtube": {
-            "client": ["android", "ios"]
-        }
-    }
 }
 YDL_FLAT = {
     "quiet": True, "no_warnings": True,
     "skip_download": True, "noplaylist": True,
     "extract_flat": True,
-    "extractor_args": {
-        "youtube": {
-            "client": ["android", "ios"]
-        }
-    }
 }
 
 cookies_path = "cookies.txt"
