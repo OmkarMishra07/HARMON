@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Velox Music Backend — S3-backed audio caching
-==============================================
+Velox Music Backend — JioSaavn API & S3-backed audio caching
+==============================================================
 Cache hierarchy (fastest → slowest):
   1. In-memory dict   — 0 ms  (same session, hot paths)
   2. S3 presigned URL — ~80ms (persists forever, survives restarts)
-  3. yt-dlp + YouTube — ~5s   (only on first-ever play of a song)
+  3. JioSaavn API     — ~1s   (only on first-ever play of a song)
 
 S3 upload strategy:
-  - On cache miss: serve user immediately from YouTube URL
+  - On cache miss: serve user immediately from JioSaavn audio stream
   - Simultaneously download full audio and upload to S3 in background thread
   - Next request for same song hits S3 → instant presigned URL returned
 """
 
-import os, sys, io, json, time, threading, logging
+import os, sys, io, json, time, threading, logging, subprocess, socket
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
@@ -24,7 +24,6 @@ from botocore.exceptions import ClientError
 import requests as req_lib
 from flask import Flask, jsonify, request, send_from_directory, Response, stream_with_context, redirect
 from flask_cors import CORS
-import yt_dlp
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -59,6 +58,44 @@ if S3_BUCKET and S3_REGION and AWS_ACCESS and AWS_SECRET:
 else:
     log.warning("[S3] Environment variables missing. Running in local fallback mode (no S3 cache).")
 
+# JioSaavn API Configuration
+JIOSAAVN_API_URL = os.environ.get("JIOSAAVN_API_URL", "http://localhost:3000")
+
+
+# ── Ensure JioSaavn API is running ────────────────────────────────────────────
+def _ensure_jiosaavn_api():
+    if "localhost" in JIOSAAVN_API_URL or "127.0.0.1" in JIOSAAVN_API_URL:
+        # Check if the port is already listening
+        try:
+            port = int(JIOSAAVN_API_URL.split(":")[-1].split("/")[0])
+        except Exception:
+            port = 3000
+        
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        try:
+            s.connect(("127.0.0.1", port))
+            s.close()
+            log.info(f"[JioSaavn API] Server detected on port {port}")
+        except Exception:
+            # Not running, start it
+            log.info(f"[JioSaavn API] Not running. Launching local API on port {port}...")
+            jio_dir = os.path.join(os.path.dirname(__file__), "jiosaavn-api")
+            if os.path.exists(jio_dir):
+                subprocess.Popen(
+                    ["npx", "tsx", "serve.js"],
+                    cwd=jio_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=True
+                )
+                log.info("[JioSaavn API] Started server process 'npx tsx serve.js' in background")
+                # Wait briefly for server boot
+                time.sleep(2)
+            else:
+                log.warning("[JioSaavn API] Local 'jiosaavn-api' folder not found. Please self-host it manually.")
+
+
 import re
 
 def _sanitize_filename(name: str) -> str:
@@ -69,40 +106,39 @@ def _sanitize_filename(name: str) -> str:
     return s[:60].strip("_")
 
 def _clean_song_title(title: str) -> str:
-    # 1. Remove common bracketed/parenthesized tags like (Official Video), [Lyrics], etc.
+    # Remove common tags
     tag_pattern = r"\s*[\(\[][^\]\)]*(?:official|lyrics?|video|audio|visualizer|clip|hd|hq|4k|remix|cover|edit|mv|ft\.|feat\.)[^\]\)]*[\)\]]"
     cleaned = re.sub(tag_pattern, "", title, flags=re.IGNORECASE)
     
-    # 2. Also remove loose tags like "Official Video" at the end
     loose_pattern = r"\s*-\s*(?:official|lyrics?|video|audio|visualizer|clip)\b"
     cleaned = re.sub(loose_pattern, "", cleaned, flags=re.IGNORECASE)
 
-    # 3. Clean up dangling delimiters like "Artist - Song - " or "Song | "
     cleaned = re.sub(r"\s*[|:\-–—\s]+$", "", cleaned)
     cleaned = re.sub(r"^\s*[|:\-–—\s]+", "", cleaned)
     
-    # 4. Collapse multiple spaces
     cleaned = re.sub(r"\s+", " ", cleaned)
-    
     return cleaned.strip() or title
 
-def _audio_key(vid: str, title: str | None = None) -> str:
+def _audio_key(vid: str, title: str | None = None, ext: str = "mp4") -> str:
     if title:
         sanitized = _sanitize_filename(title)
-        return f"audio/{sanitized}_{vid}.webm"
-    return f"audio/{vid}.webm"
+        return f"audio/{sanitized}_{vid}.{ext}"
+    return f"audio/{vid}.{ext}"
 
 def _find_audio_key(vid: str, title: str | None = None) -> str:
-    if title:
-        key_with_title = _audio_key(vid, title)
-        if _s3_exists(key_with_title):
-            return key_with_title
-    
-    key_without_title = _audio_key(vid)
-    if _s3_exists(key_without_title):
-        return key_without_title
+    # Check for multiple possible extensions to support legacy .webm files as well as new .mp4/.mp3 files
+    for ext in ["mp4", "mp3", "webm"]:
+        if title:
+            key_with_title = _audio_key(vid, title, ext)
+            if _s3_exists(key_with_title):
+                return key_with_title
         
-    return _audio_key(vid, title)
+        key_without_title = _audio_key(vid, None, ext)
+        if _s3_exists(key_without_title):
+            return key_without_title
+            
+    # Default to mp4 for new files
+    return _audio_key(vid, title, "mp4")
 
 def _meta_key(vid: str)  -> str: return f"meta/{vid}.json"
 
@@ -173,11 +209,11 @@ def _s3_put_meta(vid: str, meta: dict):
 
 
 # ── Background S3 upload ──────────────────────────────────────────────────────
-_uploading: set = set()   # video IDs currently being uploaded (dedup)
+_uploading: set = set()   # song IDs currently being uploaded (dedup)
 
-def _bg_upload(yt_url: str, vid: str, meta: dict):
+def _bg_upload(audio_url: str, vid: str, meta: dict):
     """
-    Background thread: download audio from YouTube → upload to S3.
+    Background thread: download audio from JioSaavn → upload to S3.
     User is already listening; this runs silently behind the scenes.
     """
     if not s3:
@@ -188,9 +224,18 @@ def _bg_upload(yt_url: str, vid: str, meta: dict):
     try:
         title = meta.get("title", "")
         log.info(f"[S3 ↑] downloading {vid} ({title[:30]}) for upload…")
-        r = req_lib.get(yt_url, headers=YT_HEADERS, stream=True, timeout=300)
+        r = req_lib.get(audio_url, headers=HEADERS, stream=True, timeout=300)
         r.raise_for_status()
-        content_type = r.headers.get("Content-Type", "audio/webm")
+        content_type = r.headers.get("Content-Type", "audio/mp4")
+
+        # Determine the file extension dynamically from the content type or URL
+        ext = "mp4"
+        if "mpeg" in content_type or "mp3" in content_type:
+            ext = "mp3"
+        elif "webm" in content_type:
+            ext = "webm"
+        elif ".mp3" in audio_url.lower():
+            ext = "mp3"
 
         buf = io.BytesIO()
         for chunk in r.iter_content(chunk_size=131_072):   # 128 KB chunks
@@ -199,7 +244,7 @@ def _bg_upload(yt_url: str, vid: str, meta: dict):
         buf.seek(0)
 
         # Upload with human readable filename using sanitized title and vid
-        key = _audio_key(vid, title)
+        key = _audio_key(vid, title, ext)
         s3.upload_fileobj(
             buf, S3_BUCKET, key,
             ExtraArgs={"ContentType": content_type},
@@ -214,7 +259,7 @@ def _bg_upload(yt_url: str, vid: str, meta: dict):
 
 # ── In-memory caches ──────────────────────────────────────────────────────────
 _mem:     dict = {}   # query_key → result  (expires after CACHE_TTL)
-_vid_map: dict = {}   # query_key → video_id (never expires in-session, populated by suggest)
+_vid_map: dict = {}   # query_key → song_id (never expires in-session, populated by suggest)
 _lock = threading.Lock()
 
 _vid_map_path = "vid_map.json"
@@ -225,16 +270,16 @@ def _load_vid_map():
         try:
             with open(_vid_map_path, "r", encoding="utf-8") as f:
                 _vid_map = json.load(f)
-            log.info(f"[Cache] Loaded {len(_vid_map)} video mappings from local file.")
+            log.info(f"[Cache] Loaded {len(_vid_map)} song mappings from local file.")
         except Exception as e:
-            log.warning(f"[Cache] Failed to load local video map: {e}")
+            log.warning(f"[Cache] Failed to load local song map: {e}")
 
 def _save_vid_map():
     try:
         with open(_vid_map_path, "w", encoding="utf-8") as f:
             json.dump(_vid_map, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.warning(f"[Cache] Failed to save local video map: {e}")
+        log.warning(f"[Cache] Failed to save local song map: {e}")
 
 def _update_vid_map(key: str, vid: str):
     k = key.lower().strip()
@@ -250,27 +295,9 @@ _load_vid_map()
 _inflight: dict = {}
 _inflight_lock = threading.Lock()
 
-CACHE_TTL = 3500     # ~58 min — just under YouTube URL lifetime (~6 h)
-                     # S3 presigned URLs renew every call so they never stale
+CACHE_TTL = 3500     # ~58 min — S3 presigned URLs renew every call so they never stale
 
-# ── yt-dlp options ────────────────────────────────────────────────────────────
-YDL_FULL = {
-    "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
-    "quiet": True, "no_warnings": True,
-    "skip_download": True, "noplaylist": True,
-}
-YDL_FLAT = {
-    "quiet": True, "no_warnings": True,
-    "skip_download": True, "noplaylist": True,
-    "extract_flat": True,
-}
-
-cookies_path = "cookies.txt"
-if os.path.exists(cookies_path):
-    YDL_FULL["cookiefile"] = cookies_path
-    YDL_FLAT["cookiefile"] = cookies_path
-    log.info("[yt-dlp] Using local cookies.txt for YouTube authentication.")
-YT_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -278,15 +305,13 @@ YT_HEADERS = {
     ),
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.youtube.com/",
-    "Origin": "https://www.youtube.com",
 }
 
 
-# ── Core: fast video-ID lookup ────────────────────────────────────────────────
+# ── Core: fast song-ID lookup ─────────────────────────────────────────────────
 def _get_vid_id(query: str) -> str | None:
     """
-    Get YouTube video ID via fast flat extraction (~1-2s).
+    Get JioSaavn song ID via fast search endpoint.
     Result cached in _vid_map so repeated calls are instant.
     """
     k = query.lower().strip()
@@ -294,31 +319,17 @@ def _get_vid_id(query: str) -> str | None:
         if k in _vid_map:
             return _vid_map[k]
     try:
-        with yt_dlp.YoutubeDL(YDL_FLAT) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        if info and info.get("entries"):
-            vid = info["entries"][0].get("id")
-            if vid:
-                _update_vid_map(k, vid)
-                return vid
+        r = req_lib.get(f"{JIOSAAVN_API_URL}/api/search/songs", params={"query": query})
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success") and data.get("data", {}).get("results"):
+                vid = data["data"]["results"][0].get("id")
+                if vid:
+                    _update_vid_map(k, vid)
+                    return vid
     except Exception as e:
         log.error(f"[VID-ID ERR] {e}")
     return None
-
-
-def _pick_best_url(video: dict) -> str | None:
-    fmts = video.get("formats") or []
-    audio_only = [
-        f for f in fmts
-        if f.get("acodec") != "none" and f.get("vcodec") in (None, "none", "")
-    ]
-    audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-    if audio_only:
-        return audio_only[0]["url"]
-    muxed = [f for f in fmts if f.get("acodec") != "none"]
-    if muxed:
-        return muxed[0]["url"]
-    return video.get("url")
 
 
 # ── Core: main fetch (cache hierarchy) ───────────────────────────────────────
@@ -355,7 +366,6 @@ def _fetch_song(query: str, upload_to_s3: bool = True, video_id: str | None = No
     result = None
     try:
         # ── Layer 2: S3 cache ─────────────────────────────────────
-        # Step 2a: get video ID (fast, ~1-2s; or 0ms if already in _vid_map)
         with _lock:
             cached_vid = _vid_map.get(key)
         vid = video_id or cached_vid or _get_vid_id(query)
@@ -378,41 +388,67 @@ def _fetch_song(query: str, upload_to_s3: bool = True, video_id: str | None = No
                     log.info(f"[S3  ⚡] {vid} ({title[:30]})")
                     return result
 
-        # ── Layer 3: yt-dlp full fetch ────────────────────────────
-        log.info(f"[YT  🔍] {key[:55]}")
-        with yt_dlp.YoutubeDL(YDL_FULL) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        if not info or not info.get("entries"):
+        # ── Layer 3: JioSaavn Fetch ───────────────────────────────
+        log.info(f"[JioSaavn 🔍] {key[:55]}")
+        song_data = None
+
+        if vid:
+            # Query song details directly by ID
+            r = req_lib.get(f"{JIOSAAVN_API_URL}/api/songs/{vid}")
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("success") and data.get("data"):
+                    song_data = data["data"][0]
+
+        if not song_data:
+            # Fallback to search if ID lookup fails
+            r = req_lib.get(f"{JIOSAAVN_API_URL}/api/search/songs", params={"query": query})
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("success") and data.get("data", {}).get("results"):
+                    song_data = data["data"]["results"][0]
+
+        if not song_data:
             return None
 
-        video = info["entries"][0]
-        vid   = video.get("id", "") or vid or ""
-        
-        raw_title = video.get("title", query)
+        vid = song_data.get("id") or vid or ""
+        raw_title = song_data.get("name", query)
         clean_title = _clean_song_title(raw_title)
         
         _update_vid_map(key, vid)
         _update_vid_map(clean_title, vid)
 
-        yt_url = _pick_best_url(video)
-        if not yt_url:
+        # Get highest quality stream url
+        dl_urls = song_data.get("downloadUrl", [])
+        audio_url = ""
+        for u in dl_urls:
+            if u.get("quality") == "320kbps":
+                audio_url = u.get("url")
+                break
+        if not audio_url and dl_urls:
+            audio_url = dl_urls[-1].get("url")
+
+        if not audio_url:
             return None
 
-        thumb = (
-            video.get("thumbnail")
-            or (f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else "")
-        )
+        # Build thumbnail and artists information
+        images = song_data.get("image", [])
+        thumb = images[-1].get("url") if images else ""
+        
+        artists_list = song_data.get("artists", {}).get("primary", [])
+        channel = ", ".join([a.get("name", "") for a in artists_list if a.get("name")])
+
         s3_meta = {
             "title":     clean_title,
             "thumbnail": thumb,
-            "duration":  video.get("duration", 0),
-            "channel":   video.get("channel") or video.get("uploader", ""),
+            "duration":  int(song_data.get("duration", 0)),
+            "channel":   channel,
             "video_id":  vid,
         }
         result = {
             **s3_meta,
-            "url":     yt_url,
-            "source":  "youtube",
+            "url":     audio_url,
+            "source":  "jiosaavn",
             "expires": time.time() + CACHE_TTL,
         }
         with _lock:
@@ -421,7 +457,7 @@ def _fetch_song(query: str, upload_to_s3: bool = True, video_id: str | None = No
         # ── Kick off background S3 upload ─────────────────────────
         if upload_to_s3 and vid and vid not in _uploading:
             log.info(f"[S3 ↑] queuing upload for {vid}")
-            executor.submit(_bg_upload, yt_url, vid, s3_meta)
+            executor.submit(_bg_upload, audio_url, vid, s3_meta)
 
         return result
 
@@ -436,30 +472,39 @@ def _fetch_song(query: str, upload_to_s3: bool = True, video_id: str | None = No
 
 def _fetch_suggestions(query: str) -> list:
     try:
-        with yt_dlp.YoutubeDL(YDL_FLAT) as ydl:
-            info = ydl.extract_info(f"ytsearch6:{query}", download=False)
-        if not info or "entries" not in info:
+        r = req_lib.get(f"{JIOSAAVN_API_URL}/api/search/songs", params={"query": query})
+        if r.status_code != 200:
             return []
+        data = r.json()
+        if not data.get("success") or not data.get("data", {}).get("results"):
+            return []
+        
         out = []
-        for e in info["entries"]:
+        for e in data["data"]["results"]:
             if not e:
                 continue
             vid = e.get("id", "")
-            raw_title = e.get("title", "")
+            raw_title = e.get("name", "")
             clean_title = _clean_song_title(raw_title)
             
-            # Map both raw and cleaned titles to the video ID
+            artists_list = e.get("artists", {}).get("primary", [])
+            channel = ", ".join([a.get("name", "") for a in artists_list if a.get("name")])
+            
+            # Map both raw and cleaned titles to the song ID
             if vid:
                 if raw_title:
                     _vid_map[raw_title.lower().strip()] = vid
                 if clean_title:
                     _vid_map[clean_title.lower().strip()] = vid
             
+            images = e.get("image", [])
+            thumb = images[-1].get("url") if images else ""
+
             out.append({
                 "title":    clean_title,
-                "channel":  e.get("channel") or e.get("uploader", ""),
-                "duration": e.get("duration", 0),
-                "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else "",
+                "channel":  channel,
+                "duration": int(e.get("duration", 0)),
+                "thumbnail": thumb,
                 "video_id": vid,
             })
         return out
@@ -483,7 +528,7 @@ def suggest():
 
     items = _fetch_suggestions(q)
 
-    # Prefetch top 2 — if they're already in S3 (via _vid_map) this is instant
+    # Prefetch top 2 — if they're already in S3 this is instant
     for item in items[:2]:
         k = item["title"].lower().strip()
         with _lock:
@@ -499,8 +544,8 @@ def meta():
     """
     Primary play endpoint.
     Returns audio_url which is either:
-      - An S3 presigned URL  (source=s3)    → browser plays directly from S3, ~80ms
-      - A YouTube CDN URL    (source=youtube)→ browser plays directly from YT, first play
+      - An S3 presigned URL  (source=s3)        → browser plays directly from S3, ~80ms
+      - A JioSaavn direct link (source=jiosaavn) → browser plays directly, first play
     """
     q = request.args.get("q", "").strip()
     video_id = request.args.get("video_id", "").strip() or None
@@ -518,7 +563,7 @@ def meta():
         "channel":   result["channel"],
         "video_id":  result.get("video_id", ""),
         "audio_url": result["url"],
-        "source":    result.get("source", "youtube"),  # "s3" or "youtube"
+        "source":    result.get("source", "jiosaavn"),  # "s3" or "jiosaavn"
     })
 
 
@@ -527,7 +572,7 @@ def stream_audio():
     """
     Proxy fallback — only used if browser can't play audio_url directly.
     For S3 URLs: issues a 302 redirect (browser fetches from S3 directly).
-    For YouTube URLs: proxies through Flask (last resort).
+    For JioSaavn URLs: proxies through Flask.
     """
     q = request.args.get("q", "").strip()
     video_id = request.args.get("video_id", "").strip() or None
@@ -540,37 +585,37 @@ def stream_audio():
 
     audio_url = result["url"]
 
-    # S3 URLs → just redirect (browser fetches directly, no proxy overhead)
+    # S3 URLs → just redirect
     if result.get("source") == "s3":
         return redirect(audio_url, code=302)
 
-    # YouTube URLs → proxy
-    headers = dict(YT_HEADERS)
+    # JioSaavn URLs → proxy
+    headers = dict(HEADERS)
     rng = request.headers.get("Range")
     if rng:
         headers["Range"] = rng
     try:
-        yt_resp = req_lib.get(audio_url, headers=headers, stream=True, timeout=20)
+        jio_resp = req_lib.get(audio_url, headers=headers, stream=True, timeout=20)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 502
 
     resp_headers = {
-        "Content-Type":  yt_resp.headers.get("Content-Type", "audio/webm"),
+        "Content-Type":  jio_resp.headers.get("Content-Type", "audio/mp4"),
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-store",
         "Access-Control-Allow-Origin": "*",
     }
     for h in ("Content-Length", "Content-Range"):
-        if h in yt_resp.headers:
-            resp_headers[h] = yt_resp.headers[h]
+        if h in jio_resp.headers:
+            resp_headers[h] = jio_resp.headers[h]
 
     @stream_with_context
     def gen():
-        for chunk in yt_resp.iter_content(chunk_size=65_536):
+        for chunk in jio_resp.iter_content(chunk_size=65_536):
             if chunk:
                 yield chunk
 
-    return Response(gen(), status=yt_resp.status_code, headers=resp_headers)
+    return Response(gen(), status=jio_resp.status_code, headers=resp_headers)
 
 
 @app.route("/api/prefetch")
@@ -590,7 +635,7 @@ def cache_status():
         ]
     return jsonify({
         "memory_cache":         len(mem_entries),
-        "video_id_map":         len(_vid_map),
+        "song_id_map":          len(_vid_map),
         "s3_uploads_active":    len(_uploading),
         "s3_bucket":            S3_BUCKET,
         "s3_region":            S3_REGION,
@@ -601,9 +646,14 @@ def cache_status():
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    
+    # Auto-start JioSaavn node server if running locally
+    _ensure_jiosaavn_api()
+
     print("\n" + "=" * 55)
-    print("  Velox Music  —  S3-backed streaming")
+    print("  Velox Music  —  JioSaavn & S3 streaming")
     print(f"  Bucket : {S3_BUCKET}  ({S3_REGION})")
+    print(f"  API    : {JIOSAAVN_API_URL}")
     print(f"  URL    : http://localhost:5000")
     print("=" * 55 + "\n")
 

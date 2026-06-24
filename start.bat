@@ -5,7 +5,7 @@ echo ==========================================
 echo.
 
 :: Check if pip packages are installed
-python -c "import flask, flask_cors, yt_dlp" 2>nul
+python -c "import flask, flask_cors, requests, boto3, dotenv" 2>nul
 if errorlevel 1 (
     echo Installing dependencies...
     pip install -r requirements.txt
