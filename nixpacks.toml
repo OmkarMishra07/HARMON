@@ -1,0 +1,5 @@
+# nixpacks.toml
+# Tells Railway to install both Python and Node.js for dual-runtime support.
+
+[phases.setup]
+nixPkgs = ["python3", "nodejs"]

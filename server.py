@@ -82,6 +82,15 @@ def _ensure_jiosaavn_api():
             log.info(f"[JioSaavn API] Not running. Launching local API on port {port}...")
             jio_dir = os.path.join(os.path.dirname(__file__), "jiosaavn-api")
             if os.path.exists(jio_dir):
+                # Ensure node dependencies are installed
+                node_modules_path = os.path.join(jio_dir, "node_modules")
+                if not os.path.exists(node_modules_path):
+                    log.info("[JioSaavn API] node_modules missing. Installing npm packages...")
+                    try:
+                        subprocess.run(["npm", "install"], cwd=jio_dir, check=True, shell=True)
+                    except Exception as e:
+                        log.error(f"[JioSaavn API] npm install failed: {e}")
+
                 subprocess.Popen(
                     ["npx", "tsx", "serve.js"],
                     cwd=jio_dir,
