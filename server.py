@@ -59,48 +59,7 @@ else:
     log.warning("[S3] Environment variables missing. Running in local fallback mode (no S3 cache).")
 
 # JioSaavn API Configuration
-JIOSAAVN_API_URL = os.environ.get("JIOSAAVN_API_URL", "http://127.0.0.1:3000")
-
-
-# ── Ensure JioSaavn API is running ────────────────────────────────────────────
-def _ensure_jiosaavn_api():
-    if "localhost" in JIOSAAVN_API_URL or "127.0.0.1" in JIOSAAVN_API_URL:
-        # Check if the port is already listening
-        try:
-            port = int(JIOSAAVN_API_URL.split(":")[-1].split("/")[0])
-        except Exception:
-            port = 3000
-        
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.0)
-        try:
-            s.connect(("127.0.0.1", port))
-            s.close()
-            log.info(f"[JioSaavn API] Server detected on port {port}")
-        except Exception:
-            # Not running, start it
-            log.info(f"[JioSaavn API] Not running. Launching local API on port {port}...")
-            jio_dir = os.path.join(os.path.dirname(__file__), "jiosaavn-api")
-            if os.path.exists(jio_dir):
-                # Ensure node dependencies are installed
-                node_modules_path = os.path.join(jio_dir, "node_modules")
-                if not os.path.exists(node_modules_path):
-                    log.info("[JioSaavn API] node_modules missing. Installing npm packages...")
-                    try:
-                        subprocess.run("npm install", cwd=jio_dir, check=True, shell=True)
-                    except Exception as e:
-                        log.error(f"[JioSaavn API] npm install failed: {e}")
-
-                subprocess.Popen(
-                    "npx tsx serve.js",
-                    cwd=jio_dir,
-                    shell=True
-                )
-                log.info("[JioSaavn API] Started server process 'npx tsx serve.js' in background")
-                # Wait briefly for server boot
-                time.sleep(2)
-            else:
-                log.warning("[JioSaavn API] Local 'jiosaavn-api' folder not found. Please self-host it manually.")
+JIOSAAVN_API_URL = os.environ.get("JIOSAAVN_API_URL", "https://jiosavnapi-production.up.railway.app").rstrip("/")
 
 
 import re
@@ -654,8 +613,7 @@ def cache_status():
 if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     
-    # Auto-start JioSaavn node server if running locally
-    _ensure_jiosaavn_api()
+    # Configure CORS on bucket so browser can play directly
 
     print("\n" + "=" * 55)
     print("  Velox Music  —  JioSaavn & S3 streaming")

@@ -1,11 +1,10 @@
 # nixpacks.toml
-# Tells Railway to install both Python and Node.js for dual-runtime support.
+# Tells Railway to install Python environment for the Flask backend.
 
 [phases.setup]
-nixPkgs = ["python3", "nodejs"]
+nixPkgs = ["python3"]
 
 [phases.install]
 cmds = [
-  "pip install -r requirements.txt",
-  "npm install --prefix jiosaavn-api"
+  "pip install -r requirements.txt"
 ]
