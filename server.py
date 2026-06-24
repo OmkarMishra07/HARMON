@@ -59,7 +59,7 @@ else:
     log.warning("[S3] Environment variables missing. Running in local fallback mode (no S3 cache).")
 
 # JioSaavn API Configuration
-JIOSAAVN_API_URL = os.environ.get("JIOSAAVN_API_URL", "http://localhost:3000")
+JIOSAAVN_API_URL = os.environ.get("JIOSAAVN_API_URL", "http://127.0.0.1:3000")
 
 
 # ── Ensure JioSaavn API is running ────────────────────────────────────────────
