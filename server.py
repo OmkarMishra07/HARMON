@@ -94,8 +94,6 @@ def _ensure_jiosaavn_api():
                 subprocess.Popen(
                     "npx tsx serve.js",
                     cwd=jio_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
                     shell=True
                 )
                 log.info("[JioSaavn API] Started server process 'npx tsx serve.js' in background")
