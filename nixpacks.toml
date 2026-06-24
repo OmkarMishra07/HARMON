@@ -3,3 +3,9 @@
 
 [phases.setup]
 nixPkgs = ["python3", "nodejs"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "npm install --prefix jiosaavn-api"
+]

@@ -87,12 +87,12 @@ def _ensure_jiosaavn_api():
                 if not os.path.exists(node_modules_path):
                     log.info("[JioSaavn API] node_modules missing. Installing npm packages...")
                     try:
-                        subprocess.run(["npm", "install"], cwd=jio_dir, check=True, shell=True)
+                        subprocess.run("npm install", cwd=jio_dir, check=True, shell=True)
                     except Exception as e:
                         log.error(f"[JioSaavn API] npm install failed: {e}")
 
                 subprocess.Popen(
-                    ["npx", "tsx", "serve.js"],
+                    "npx tsx serve.js",
                     cwd=jio_dir,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
